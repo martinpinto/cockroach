@@ -6103,12 +6103,12 @@ func TestReplicaRetryRaftProposal(t *testing.T) {
 	iArg := incrementArgs(roachpb.Key("b"), expInc)
 	ba.Add(&iArg)
 	{
-		br, pErr, shouldRetry := tc.repl.tryAddWriteCmd(
+		br, pErr, retry := tc.repl.tryAddWriteCmd(
 			context.WithValue(ctx, magicKey{}, "foo"),
 			ba,
 		)
-		if !shouldRetry {
-			t.Fatalf("expected retry, but got (%v, %v)", br, pErr)
+		if retry != proposalIllegalLeaseIndex {
+			t.Fatalf("expected retry from illegal lease index, but got (%v, %v, %d)", br, pErr, retry)
 		}
 		if exp, act := int32(1), atomic.LoadInt32(&c); exp != act {
 			t.Fatalf("expected %d proposals, got %d", exp, act)
@@ -6404,6 +6404,95 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 			if len(reproposed) != 0 {
 				t.Fatalf("%d: expected no reproposed commands, but found %+v", i, reproposed)
 			}
+		}
+	}
+}
+
+// TestAmbiguousResultErrorOnReproposal verifies that when a batch
+// with EndTransaction(commit=true) is re-proposed, it will return
+// an AmbiguousResultError if it fails on the re-proposal. It also
+// verifies that EndTransaction(commit=false) will not return an
+// AmbiguousResultError.
+func TestAmbiguousResultErrorOnReproposal(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	cfg := TestStoreConfig(nil)
+	tc := testContext{}
+	tc.StartWithStoreConfig(t, cfg)
+	defer tc.Stop()
+
+	proposed := make(chan struct{}, 1)
+	proceed := make(chan struct{}, 1)
+	errCh := make(chan error, 1)
+
+	setCustomProposalFn := func() {
+		// Install a proposal function which delays the proposal.
+		tc.repl.mu.Lock()
+		tc.repl.mu.submitProposalFn = func(pd *ProposalData) error {
+			if _, ok := pd.Cmd.GetArg(roachpb.EndTransaction); !ok {
+				return defaultSubmitProposalLocked(tc.repl, pd)
+			}
+			proposed <- struct{}{} // signal that the proposal has arrived
+			// Submit the proposal with a delay, waiting for proceed channel.
+			go func() {
+				<-proceed
+				errCh <- defaultSubmitProposalLocked(tc.repl, pd)
+			}()
+			return nil // pretend we proposed though we haven't yet.
+		}
+		tc.repl.mu.Unlock()
+	}
+
+	for _, commit := range []bool{true, false} {
+		// Launch goroutine to manually refresh proposals.
+		go func() {
+			// Wait for the proposal to be pending.
+			<-proposed
+			// Manually refresh proposals.
+			tc.repl.mu.Lock()
+			// We are going to cheat here and increase the lease applied
+			// index to force the sort of re-proposal we're after.
+			origLeaseAppliedIndex := tc.repl.mu.state.LeaseAppliedIndex
+			tc.repl.mu.state.LeaseAppliedIndex = 10
+			tc.repl.refreshProposalsLocked(tc.store.cfg.RaftElectionTimeoutTicks, reasonTicks)
+			tc.repl.mu.state.LeaseAppliedIndex = origLeaseAppliedIndex
+			// Unset the custom proposal function so re-proposal proceeds
+			// without blocking.
+			tc.repl.mu.submitProposalFn = nil
+			tc.repl.mu.Unlock()
+			// Signal the original proposal to continue.
+			proceed <- struct{}{}
+		}()
+
+		// Install the custom proposal function.
+		setCustomProposalFn()
+
+		// Try to end a transaction which doesn't exist.
+		key := roachpb.Key(fmt.Sprintf("commit=%t", commit))
+		txn := newTransaction("test", key, 1, enginepb.SERIALIZABLE, tc.Clock())
+		et, etH := endTxnArgs(txn, commit)
+		var ba roachpb.BatchRequest
+		ba.Header = etH
+		ba.Add(&et)
+		_, pErr := tc.Sender().Send(context.Background(), ba)
+
+		// If commit is true, this must return an ambiguous result, despite the
+		// failure from the re-proposed batch containing the end txn.
+		if commit {
+			if _, ok := pErr.GetDetail().(*roachpb.AmbiguousResultError); !ok {
+				t.Errorf("commit=true: expected AmbiguousResultError but got %T: %s", pErr, pErr)
+			}
+		} else {
+			if _, ok := pErr.GetDetail().(*roachpb.TransactionStatusError); !ok {
+				t.Errorf("commit=false: expected TransactionStatusError but got %T: %s", pErr, pErr)
+			}
+		}
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatal(err)
+			}
+		default:
 		}
 	}
 }
